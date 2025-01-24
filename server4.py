@@ -26,7 +26,7 @@ app = FastAPI()
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with your frontend domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,18 +35,22 @@ app.add_middleware(
 # Store the text state and active connections
 class TextState:
     def __init__(self):
-        self.current_text = "Hello, I am Ubix AI. Please feel free to ask me if you have any questions!"
+        self.default_text = "Hello, I am Ubix AI. Please feel free to ask me if you have any questions!"
+        self.current_text = self.default_text
         self.last_updated = datetime.datetime.now()
         self.active_connections: Set[asyncio.Queue] = set()
-        self.processed_texts: Dict[str, datetime.datetime] = {}
 
     async def broadcast(self, message: dict):
-        # Remove connections that are closed
         dead_connections = set()
         for queue in self.active_connections:
             try:
-                await queue.put(message)
-            except Exception:
+                # Check if message is within 1.3 seconds window
+                message_time = datetime.datetime.fromisoformat(message["timestamp"])
+                elapsed = (datetime.datetime.now() - message_time).total_seconds()
+                if elapsed <= 1.3:
+                    await queue.put(message)
+            except Exception as e:
+                logger.error(f"Error broadcasting message: {e}")
                 dead_connections.add(queue)
         
         # Cleanup dead connections
@@ -137,36 +141,39 @@ async def event_generator(request: Request, queue: asyncio.Queue):
             if await request.is_disconnected():
                 break
 
-            # Wait for new message
             message = await queue.get()
-            
-            # Convert message to SSE format
             event_data = f"data: {json.dumps(message)}\n\n"
             yield event_data
-            
-            # Acknowledge message processing
             queue.task_done()
     except Exception as e:
         logger.error(f"Error in event generator: {e}")
     finally:
-        # Cleanup when client disconnects
         text_state.active_connections.remove(queue)
         logger.info("Client disconnected from SSE")
 
 @app.get("/stream")
 async def stream_text(request: Request):
-    """SSE endpoint for streaming text updates"""
-    # Create queue for this connection
+    """SSE endpoint for streaming text updates with 1.3 second window"""
     queue = asyncio.Queue()
     text_state.active_connections.add(queue)
+
+    # Determine initial message based on time window
+    now = datetime.datetime.now()
+    elapsed = (now - text_state.last_updated).total_seconds()
     
-    # Send current text immediately if available
-    if text_state.current_text:
-        await queue.put({
+    if elapsed <= 1.3:
+        initial_message = {
             "text": text_state.current_text,
             "timestamp": text_state.last_updated.isoformat()
-        })
+        }
+    else:
+        initial_message = {
+            "text": text_state.default_text,
+            "timestamp": now.isoformat()
+        }
     
+    await queue.put(initial_message)
+
     return StreamingResponse(
         event_generator(request, queue),
         media_type="text/event-stream",
@@ -196,9 +203,9 @@ if __name__ == "__main__":
     
     logger.info(f"Starting server on port {port}...")
     uvicorn.run(
-        "server4:app",
+        "server:app",
         host="0.0.0.0",
         port=port,
-        reload=True,  # Enable auto-reload during development
+        reload=True,
         log_level="info"
     )
