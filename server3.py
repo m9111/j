@@ -8,14 +8,21 @@ from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 import base64
 import requests
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import speech_recognition as sr
 from dotenv import load_dotenv
 from openai import OpenAI
-
+from pypdf import PdfReader
+from langchain.text_splitter import CharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_openai import ChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationalRetrievalChain
+from langchain.prompts import PromptTemplate
+from langchain.chains.question_answering import load_qa_chain
 from pypdf import PdfReader
 from langchain.text_splitter import CharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
@@ -36,9 +43,9 @@ CHUNK_OVERLAP = int(os.getenv('CHUNK_OVERLAP', 200))
 MODEL_NAME = os.getenv('MODEL_NAME', 'gpt-4o-mini')
 
 # Default system message
-DEFAULT_SYSTEM_MESSAGE = """Your name is ubik ai, people will ask questions from u and u will answer that, strictly remember it, strictly answer in english and dont go out of the context that is provided to u but please cosider that there will be major speeech recognition errors so please work accordingly, You are a helpful AI assistant with access to UBIK Solutions. 
-Answer questions based on the provided context.if user sends hi or a normal message like great you dont need to respond something big you have to reply normally only, dont write unncessarily, look at what user said and understand how much is required, If you don't know something or if it's not in the context, dont go out of context, stick to what user said and form answer on that with help of context
-say so directly instead of making up information. Your name is ubik ai, answer mostly under 50 words unless very much required, send back data in a clean format"""
+DEFAULT_SYSTEM_MESSAGE = """You are a helpful AI assistant with access to knowledge about UBIK  and subsidaries. 
+Answer questions based on the provided context. If you don't know something or if it's not in the context, 
+say that you arent trained for it. also dont go out of context, Your name is ubik ai, answer mostly under 50 words unless very much required"""
 
 logging.basicConfig(
     filename='app_logs.txt',
@@ -291,6 +298,7 @@ def initialize_global_vectorstore():
         )
         logger.info("Vectorstore has been created with OpenAI embeddings.")
     return True, "[SYSTEM MESSAGE] Vectorstore was created successfully."
+
 def handle_userinput(user_question: str, user_id: str):
     user_state = get_user_state(user_id)
     conversation_chain = user_state['chain']
@@ -300,32 +308,19 @@ def handle_userinput(user_question: str, user_id: str):
     # Step 1: Define the refinement template
     def refine_input(input_text):
         refinement_prompt = f"""
-        The user provided the following input: "{input_text}"
-
-
-        Context: The input may contain minor errors or variations due to inaccuracies in communication or understanding. something as huge as ehiglo considered as ethical law or igloo or tigloo so be lineant
-        Your task is to:
-        1. Interpret the user's intent.
-        2. Provide the refined version.
-
+        Based on the following user input: "{input_text}"
         
-
-        You are trained specifically about UBIK Solutions. Follow this exact decision tree when responding:
-
-        1. First, check if the question has any relevant context in the provided knowledge base:
-           - If you find context even with misspelled words → Proceed with answering
-
-        2. If no direct context match but the question seems relevant:
-           - If unclear word might affect the answer → Ask for spelling playfully
-           - Example: "Oh! I'd love to help with that! Could you spell out [unclear word]? Just want to make sure I give you the perfect answer! 😊"
-           
-
-        3. If the question is completely irrelevant and u get no context along:
-           - Politely respond: "I'm specifically trained to help with questions about UBIK Solutions. This seems outside my expertise!"
-
-
-
-           Refined Input:
+        
+        1. If it's a basic greeting:
+            - Respond: "Hello! How can I help you with information about UBIK Solutions?"
+        
+        2. For questions:
+            - Process them directly using available context
+            - Keep responses focused and concise
+        
+        Maintain a professional tone and avoid unnecessary elaboration.
+        
+        Refined query:
         """
         return conversation_chain({'question': refinement_prompt})['answer'].strip()
 
@@ -443,7 +438,7 @@ async def ask_question(request: Request):
 
     user_id = data["user_id"]
     user_question = data["question"]
-    FORWARD_ENDPOINT = os.getenv("FORWARD_ENDPOINT", "https://c303-157-119-42-46.ngrok-free.app/receive")
+    FORWARD_ENDPOINT = os.getenv("FORWARD_ENDPOINT", "https://5vf2s8w3-10000.aue.devtunnels.ms/receive")
 
     if user_id not in user_sessions or user_sessions[user_id]['chain'] is None:
         create_or_refresh_user_chain(user_id)
@@ -645,4 +640,4 @@ async def text_to_speech_api(request: Request):
 # app.mount("/data", StaticFiles(directory="data"), name="data")
 #pip install sentence-transformers transformers torch
 # Command to run:
-# uvicorn server3:app --host 0.0.0.0 --port 8000 --reload
+# uvicorn server3:app --host 0.0.0.0 --port 8000
