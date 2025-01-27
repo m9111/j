@@ -3,6 +3,13 @@ import uuid
 import time
 import logging
 import threading
+import speech_recognition as sr
+import os
+import uuid
+from fastapi import UploadFile
+from fastapi.responses import JSONResponse
+import subprocess
+import logging
 from datetime import datetime
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
@@ -23,30 +30,24 @@ from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain.prompts import PromptTemplate
 from langchain.chains.question_answering import load_qa_chain
-from pypdf import PdfReader
-from langchain.text_splitter import CharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_openai import ChatOpenAI
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
-from langchain.prompts import PromptTemplate
-from langchain.chains.question_answering import load_qa_chain
 
+# Load environment variables
 load_dotenv()
 
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# Configuration
 CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', 1000))
 CHUNK_OVERLAP = int(os.getenv('CHUNK_OVERLAP', 200))
-MODEL_NAME = os.getenv('MODEL_NAME', 'gpt-4o-mini')
+MODEL_NAME = os.getenv('MODEL_NAME', 'gpt-3.5-turbo')
 
 # Default system message
-DEFAULT_SYSTEM_MESSAGE = """You are a helpful AI assistant with access to knowledge about UBIK  and subsidaries. 
-Answer questions based on the provided context. If you don't know something or if it's not in the context, 
-say that you arent trained for it. also dont go out of context, Your name is ubik ai, answer mostly under 50 words unless very much required"""
+DEFAULT_SYSTEM_MESSAGE = """You are a helpful AI assistant with access to knowledge about UBIK solutions and subsidaries. 
+Answer questions based on the provided context. you will answer the question that user will ask. If you don't know something or if it's not in the context, 
+say that you aren't trained for it but in a proper manner. you can respond to greetings or general greet things, Also, don't go out of context. Your name is UBIK AI. Answer mostly under 50 words unless very much required."""
 
+# Logging configuration
 logging.basicConfig(
     filename='app_logs.txt',
     level=logging.INFO,
@@ -54,15 +55,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Thread pool for concurrent tasks
 executor = ThreadPoolExecutor(max_workers=3)
 
+# Global vectorstore for document embeddings
 global_vectorstore = None
 vectorstore_lock = threading.Lock()
 
+# User sessions to store conversation chains and memory
 user_sessions = {}
 
+# Initialize FastAPI app
 app = FastAPI()
 
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -71,13 +77,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Utility functions
 def log_event(event_type: str, details: str = "", user_id: str = "Unknown"):
+    """Log events to a file."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_line = f"{timestamp} | {event_type} | UserID: {user_id} | {details}\n"
     with open("app_logs.txt", "a", encoding="utf-8") as f:
         f.write(log_line)
 
 def get_user_state(user_id: str):
+    """Get or create a user session."""
     if user_id not in user_sessions:
         user_sessions[user_id] = {
             'memory': ConversationBufferMemory(
@@ -93,6 +102,7 @@ def get_user_state(user_id: str):
 
 @lru_cache(maxsize=128)
 def get_pdf_text(pdf_path: str) -> str:
+    """Extract text from a PDF file."""
     try:
         reader = PdfReader(pdf_path)
         text = ""
@@ -104,6 +114,7 @@ def get_pdf_text(pdf_path: str) -> str:
         return ""
 
 def get_text_chunks(text: str):
+    """Split text into chunks for processing."""
     text_splitter = CharacterTextSplitter(
         separator="\n",
         chunk_size=CHUNK_SIZE,
@@ -112,160 +123,8 @@ def get_text_chunks(text: str):
     )
     return text_splitter.split_text(text)
 
-import os
-import uuid
-import json
-import base64
-import aiohttp
-import logging
-from fastapi import UploadFile
-from fastapi.responses import JSONResponse
-import subprocess
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
-
-# Configure logging
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-
-async def handle_speech_to_text(file: UploadFile):
-    logger.info(f"Starting speech to text conversion for file: {file.filename}")
-    
-    if file is None:
-        logger.error("No file provided")
-        return JSONResponse(
-            status_code=400,
-            content={"error": "No file provided."}
-        )
-    
-    # Get API key from environment
-    api_key = os.getenv('GOOGLE_API_KEY')
-    if not api_key:
-        logger.error("GOOGLE_API_KEY not found in environment variables")
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Google API key not configured"}
-        )
-
-    # Create data directory if it doesn't exist
-    os.makedirs("data", exist_ok=True)
-    
-    # Save the uploaded file temporarily
-    webm_path = os.path.join("data", f"temp_{uuid.uuid4().hex}.webm")
-    wav_path = os.path.join("data", f"temp_{uuid.uuid4().hex}.wav")
-    
-    try:
-        # Read the uploaded file
-        logger.debug("Reading uploaded file")
-        content = await file.read()
-        with open(webm_path, "wb") as f:
-            f.write(content)
-        logger.debug(f"Saved WebM file to {webm_path}")
-        
-        # Convert the WebM file to WAV format
-        logger.debug("Converting WebM to WAV")
-        try:
-            result = subprocess.run([
-                'ffmpeg', '-i', webm_path, 
-                '-acodec', 'pcm_s16le', 
-                '-ar', '16000', 
-                '-ac', '1', 
-                wav_path
-            ], check=True, capture_output=True, text=True)
-            logger.debug(f"FFmpeg output: {result.stdout}")
-            logger.debug(f"FFmpeg errors: {result.stderr}")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"FFmpeg conversion failed: {str(e)}")
-            logger.error(f"FFmpeg stderr: {e.stderr}")
-            return JSONResponse(
-                status_code=500,
-                content={"error": f"FFmpeg conversion failed: {e.stderr}"}
-            )
-
-        # Verify WAV file exists and has content
-        if not os.path.exists(wav_path):
-            logger.error("WAV file was not created")
-            return JSONResponse(
-                status_code=500,
-                content={"error": "WAV file conversion failed"}
-            )
-            
-        wav_size = os.path.getsize(wav_path)
-        logger.debug(f"WAV file size: {wav_size} bytes")
-        
-        if wav_size == 0:
-            logger.error("WAV file is empty")
-            return JSONResponse(
-                status_code=500,
-                content={"error": "Converted WAV file is empty"}
-            )
-
-        # Read the WAV file and encode it to base64
-        logger.debug("Reading and encoding WAV file")
-        with open(wav_path, "rb") as audio_file:
-            audio_content = base64.b64encode(audio_file.read()).decode('utf-8')
-
-        # Prepare the request payload
-        payload = {
-            "config": {
-                "encoding": "LINEAR16",
-                "sampleRateHertz": 16000,
-                "languageCode": "en-US",
-                "enableAutomaticPunctuation": True
-            },
-            "audio": {
-                "content": audio_content
-            }
-        }
-
-        # Make request to Google Cloud Speech-to-Text API
-        logger.debug("Making request to Google Cloud API")
-        async with aiohttp.ClientSession() as session:
-            url = f"https://speech.googleapis.com/v1/speech:recognize?key={api_key}"
-            async with session.post(url, json=payload) as response:
-                response_text = await response.text()
-                logger.debug(f"API Response status: {response.status}")
-                logger.debug(f"API Response: {response_text}")
-                
-                if response.status != 200:
-                    logger.error(f"API request failed with status {response.status}: {response_text}")
-                    return JSONResponse(
-                        status_code=response.status,
-                        content={"error": f"API request failed: {response_text}"}
-                    )
-                
-                result = json.loads(response_text)
-                
-                # Extract the transcribed text
-                transcript = ""
-                if "results" in result:
-                    for result_item in result["results"]:
-                        if "alternatives" in result_item and result_item["alternatives"]:
-                            transcript += result_item["alternatives"][0]["transcript"]
-                
-                logger.info("Successfully transcribed audio")
-                return {"status": "success", "text": transcript}
-
-    except Exception as e:
-        logger.exception("Unexpected error occurred")
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"An error occurred during transcription: {str(e)}"}
-        )
-    
-    finally:
-        # Clean up temporary files
-        logger.debug("Cleaning up temporary files")
-        if os.path.exists(webm_path):
-            os.remove(webm_path)
-            logger.debug(f"Removed {webm_path}")
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
-            logger.debug(f"Removed {wav_path}")
-
 def initialize_global_vectorstore():
+    """Initialize the global vectorstore with PDF data."""
     global global_vectorstore
     with vectorstore_lock:
         if global_vectorstore is not None:
@@ -300,6 +159,7 @@ def initialize_global_vectorstore():
     return True, "[SYSTEM MESSAGE] Vectorstore was created successfully."
 
 def handle_userinput(user_question: str, user_id: str):
+    """Handle user input and generate a response."""
     user_state = get_user_state(user_id)
     conversation_chain = user_state['chain']
     if not conversation_chain:
@@ -309,7 +169,6 @@ def handle_userinput(user_question: str, user_id: str):
     def refine_input(input_text):
         refinement_prompt = f"""
         Based on the following user input: "{input_text}"
-        
         
         1. If it's a basic greeting:
             - Respond: "Hello! How can I help you with information about UBIK Solutions?"
@@ -351,6 +210,7 @@ def handle_userinput(user_question: str, user_id: str):
     return {'text': answer}
 
 def create_or_refresh_user_chain(user_id: str):
+    """Create or refresh a conversation chain for a user."""
     user_state = get_user_state(user_id)
     if user_state['chain'] is None:
         if global_vectorstore is None:
@@ -396,9 +256,10 @@ def create_or_refresh_user_chain(user_id: str):
     else:
         return True, "Conversation chain already exists."
 
-
+# FastAPI endpoints
 @app.on_event("startup")
 async def startup_event():
+    """Initialize the global vectorstore on startup."""
     success, message = initialize_global_vectorstore()
     if not success:
         logger.error(f"Failed to initialize vectorstore: {message}")
@@ -407,6 +268,7 @@ async def startup_event():
 
 @app.get("/")
 async def hello_root():
+    """Root endpoint."""
     return {
         "message": "Hello from FastAPI server. Use the endpoints to process data or ask questions.",
         "status": "operational"
@@ -414,6 +276,7 @@ async def hello_root():
 
 @app.post("/refresh_chain")
 async def refresh_chain(request: Request):
+    """Refresh the conversation chain for a user."""
     data = await request.json()
     if "user_id" not in data:
         return JSONResponse(
@@ -428,6 +291,7 @@ async def refresh_chain(request: Request):
 
 @app.post("/ask")
 async def ask_question(request: Request):
+    """Handle user questions."""
     try:
         data = await request.json()
     except:
@@ -476,6 +340,7 @@ async def ask_question(request: Request):
 
 @app.post("/set_system_message")
 async def set_system_message(request: Request):
+    """Set a custom system message for a user."""
     try:
         data = await request.json()
     except:
@@ -510,6 +375,7 @@ async def set_system_message(request: Request):
 
 @app.get("/get_system_message")
 async def get_system_message(user_id: str):
+    """Get the system message for a user."""
     if not user_id:
         return JSONResponse(
             status_code=400,
@@ -524,6 +390,7 @@ async def get_system_message(user_id: str):
 
 @app.post("/clear_history")
 async def clear_history(request: Request):
+    """Clear the chat history for a user."""
     try:
         data = await request.json()
     except:
@@ -545,10 +412,93 @@ async def clear_history(request: Request):
 
 @app.post("/speech_to_text")
 async def speech_to_text_endpoint(file: UploadFile = File(...)):
+    """Convert speech to text."""
     return await handle_speech_to_text(file)
+async def handle_speech_to_text(file: UploadFile):
+    logger.info(f"Starting speech to text conversion for file: {file.filename}")
+    
+    if file is None:
+        logger.error("No file provided")
+        return JSONResponse(
+            status_code=400,
+            content={"error": "No file provided."}
+        )
 
+    # Create data directory if it doesn't exist
+    os.makedirs("data", exist_ok=True)
+    
+    # Generate temporary file paths
+    webm_path = os.path.join("data", f"temp_{uuid.uuid4().hex}.webm")
+    wav_path = os.path.join("data", f"temp_{uuid.uuid4().hex}.wav")
+    
+    try:
+        # Save the uploaded file
+        logger.debug("Reading uploaded file")
+        content = await file.read()
+        with open(webm_path, "wb") as f:
+            f.write(content)
+        logger.debug(f"Saved WebM file to {webm_path}")
+        
+        # Convert to WAV format
+        logger.debug("Converting WebM to WAV")
+        try:
+            subprocess.run([
+                'ffmpeg', '-i', webm_path, 
+                '-acodec', 'pcm_s16le', 
+                '-ar', '16000', 
+                '-ac', '1', 
+                wav_path
+            ], check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"FFmpeg conversion failed: {str(e)}")
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"Audio conversion failed: {e.stderr}"}
+            )
+
+        # Initialize speech recognizer
+        r = sr.Recognizer()
+        
+        # Process the audio file
+        with sr.AudioFile(wav_path) as source:
+            audio = r.record(source)  # Read the entire audio file
+            logger.debug("Processing audio with Google Speech Recognition...")
+            
+            try:
+                text = r.recognize_google(audio)
+                logger.info("Successfully transcribed audio")
+                return {"status": "success", "text": text}
+                
+            except sr.UnknownValueError:
+                logger.error("Google Speech Recognition could not understand audio")
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "Could not understand audio"}
+                )
+            except sr.RequestError as e:
+                logger.error(f"Could not request results from Google SR service; {e}")
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": f"Speech service error: {str(e)}"}
+                )
+
+    except Exception as e:
+        logger.exception("Unexpected error occurred")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"An error occurred during transcription: {str(e)}"}
+        )
+    
+    finally:
+        # Clean up temporary files
+        logger.debug("Cleaning up temporary files")
+        for path in [webm_path, wav_path]:
+            if os.path.exists(path):
+                os.remove(path)
+                logger.debug(f"Removed {path}")
 @app.post("/logout")
 async def logout(request: Request):
+    """Log out a user by clearing their session."""
     try:
         data = await request.json()
     except:
@@ -562,18 +512,12 @@ async def logout(request: Request):
         del user_sessions[user_id]
     return {"status": "success", "message": "User session cleared."}
 
-
-# ------------------------------------------------------------------------
-#       GOOGLE CLOUD TEXT-TO-SPEECH ENDPOINTS USING API KEY
-# ------------------------------------------------------------------------
-
+# Text-to-speech endpoint
 GOOGLE_TTS_API_KEY = os.getenv("GOOGLE_TTS_API_KEY")  # Load your API key from .env or environment variable
 
 @app.post("/text_to_speech")
 async def text_to_speech_api(request: Request):
-    """
-    Convert text to speech using Google Cloud TTS with API key authorization.
-    """
+    """Convert text to speech using Google Cloud TTS with API key authorization."""
     try:
         data = await request.json()
         text = data.get("text", "")
@@ -634,10 +578,3 @@ async def text_to_speech_api(request: Request):
             status_code=500,
             content={"error": "An internal error occurred during text-to-speech synthesis."}
         )
-
-
-# You can remove or comment out the StaticFiles mounting since we're not storing files anymore
-# app.mount("/data", StaticFiles(directory="data"), name="data")
-#pip install sentence-transformers transformers torch
-# Command to run:
-# uvicorn server3:app --host 0.0.0.0 --port 8000
